@@ -48,7 +48,7 @@ def main():
         parser.error('Thiếu --model hoặc MODEL')
     if args.max_steps < 1 or not 1 <= args.workers <= 8:
         parser.error('--max-steps phải >= 1 và --workers phải từ 1 đến 8')
-    cases = json.loads((Path(__file__).parent / 'cases.json').read_text())
+    cases = json.loads((Path(__file__).parent / 'cases.json').read_text(encoding='utf-8'))
     selected = [c for c in cases if not args.case or c['id'] == args.case.upper()]
     if not selected:
         parser.error('Không tìm thấy case')
@@ -61,7 +61,7 @@ def main():
         results = list(pool.map(run_and_print, selected))
     report = {'summary': summarize(results), 'config': {'provider': args.provider, 'model': args.model,
               'judge_provider': args.judge_provider, 'judge_model': args.judge_model, 'max_steps': args.max_steps}, 'cases': results}
-    Path(args.output).write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n')
+    Path(args.output).write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
     summary = report['summary']
     print(f"Điểm: {summary['score_0_100']}/100; đã chấm {summary['scored_cases']}/{summary['total_cases']} case. File: {args.output}")
     if summary['score_0_100'] is None:

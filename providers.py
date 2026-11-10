@@ -1,6 +1,7 @@
 """Bốn provider cùng một interface. Không chứa agent loop."""
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 
@@ -12,16 +13,43 @@ CONFIG = {
 }
 
 
-def post_json(url, headers, payload):
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json', **headers})
+RATE_LIMIT_RETRIES = 8  # Groq giới hạn 8.000 token/phút; một request lớn có thể cần vài lần chờ
+MAX_RETRY_WAIT = 120  # giây
+
+
+def _retry_wait(exc, attempt):
+    """Chờ theo retry-after nếu có, nếu không dùng backoff tăng dần."""
+    raw = exc.headers.get('retry-after') if getattr(exc, 'headers', None) else None
     try:
-        with urllib.request.urlopen(req, timeout=60) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as exc:
-        # Do not print response bodies: they may contain account or request data.
-        raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
+        wait = float(raw)
+    except (TypeError, ValueError):
+        wait = 15.0 * attempt
+    return min(max(wait, 1.0), MAX_RETRY_WAIT)
+
+
+def post_json(url, headers, payload):
+    body = json.dumps(payload).encode()
+    # Một số endpoint (ví dụ Groq qua Cloudflare) chặn User-Agent mặc định của urllib bằng HTTP 403.
+    base_headers = {'Content-Type': 'application/json', 'User-Agent': 'StatusAgentLab/1.0 (educational classroom)', **headers}
+    for attempt in range(1, RATE_LIMIT_RETRIES + 2):
+        req = urllib.request.Request(url, data=body, headers=base_headers)
+        try:
+            with urllib.request.urlopen(req, timeout=60) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            # 429: giới hạn tốc độ tạm thời; chờ rồi thử lại trong giới hạn số lần.
+            if exc.code == 429 and attempt <= RATE_LIMIT_RETRIES:
+                time.sleep(_retry_wait(exc, attempt))
+                continue
+            # Do not print response bodies: they may contain account or request data.
+            raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
+        except (urllib.error.URLError, ConnectionError, TimeoutError) as exc:
+            # Lỗi mạng tạm thời (ví dụ connection reset): thử lại trong giới hạn số lần.
+            if attempt <= RATE_LIMIT_RETRIES:
+                time.sleep(_retry_wait(None, attempt))
+                continue
+            reason = getattr(exc, 'reason', exc)
+            raise RuntimeError(f'Không kết nối được provider: {reason}') from exc
 
 
 class Provider:
@@ -40,6 +68,10 @@ class Provider:
         self.key = os.getenv(key_name)
         if not self.key:
             raise ValueError(f'Thiếu {key_name}; xem README.md.')
+        # OPENAI_BASE_URL cho phép trỏ provider openai tới endpoint tương thích (ví dụ Groq).
+        base_url = os.getenv('OPENAI_BASE_URL') if name == 'openai' else None
+        if base_url:
+            self.url = base_url.rstrip('/') + '/chat/completions'
 
     def complete(self, messages, schemas):
         if self.name == 'anthropic':
@@ -64,7 +96,14 @@ class Provider:
                 if m.get('content'):
                     blocks.append({'type': 'text', 'text': m['content']})
                 for call in m.get('tool_calls', []):
-                    blocks.append({'type': 'tool_use', 'id': call['id'], 'name': call['function']['name'], 'input': json.loads(call['function']['arguments'])})
+                    try:
+                        call_input = json.loads(call['function']['arguments'])
+                    except (json.JSONDecodeError, TypeError):
+                        # Arguments lỗi đã được trả INVALID_ARGUMENTS ở tool result; không để adapter crash.
+                        call_input = {}
+                    if not isinstance(call_input, dict):
+                        call_input = {}
+                    blocks.append({'type': 'tool_use', 'id': call['id'], 'name': call['function']['name'], 'input': call_input})
                 native.append({'role': 'assistant', 'content': blocks})
             elif m['role'] == 'tool':
                 block = {'type': 'tool_result', 'tool_use_id': m['tool_call_id'], 'content': m['content']}
